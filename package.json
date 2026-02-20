@@ -1,0 +1,20 @@
+{
+  "name": "guga-go",
+  "private": true,
+  "version": "0.0.1",
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "server": "node server/ai_server.js",
+    "dev:all": "node server/ai_server.js & vite",
+    "docs:generate": "node scripts/generate_docs.js"
+  },
+  "dependencies": {
+    "react": "^18.2.0",
+    "react-dom": "^18.2.0",
+    "ws": "^8.16.0"
+  },
+  "devDependencies": {
+    "vite": "^5.0.0"
+  }
+}

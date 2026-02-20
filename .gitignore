@@ -1,0 +1,9 @@
+/matches/
+/node_modules/
+/dist/
+/gtp_logs/
+*.log
+.DS_Store
+Thumbs.db
+.env
+.env.*
