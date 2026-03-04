@@ -308,3 +308,4 @@ export default function GoBoardView({
     </svg>
   );
 }
+

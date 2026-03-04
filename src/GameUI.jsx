@@ -5,7 +5,7 @@ import {
   computeFinalScore,
   scoreWithDead,
   suggestDeadStones,
-} from "./gameEngine";
+} from "../shared/game/engine";
 import PlayerBarView from "./components/PlayerBarView";
 import ActionPanelView from "./components/ActionPanelView";
 import GoBoardView from "./components/GoBoardView";
@@ -13,7 +13,7 @@ import GameLogView from "./components/GameLogView";
 import ChatPanelView from "./components/ChatPanelView";
 import KifuControlView from "./components/KifuControlView";
 import RulesPageUI from "./RulesPageUI";
-import { buildHistoryFromSgf, buildSgfFromHistory, parseSgf } from "./sgf";
+import { buildHistoryFromSgf, buildSgfFromHistory, parseSgf } from "../shared/game/sgf";
 import captureStoneSound from "./sound/captureStone.mp3";
 import newGameSound from "./sound/newgame.mp3";
 import passStoneSound from "./sound/passStone.mp3";
@@ -1091,3 +1091,5 @@ export default function GameUI({
     </div>
   );
 }
+
+

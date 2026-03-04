@@ -111,3 +111,4 @@ export default function RulesPageUI({ t = (key) => key, lang = "ko" }) {
     </div>
   );
 }
+

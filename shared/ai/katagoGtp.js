@@ -293,7 +293,16 @@ export const sendWithRetry = async (client, command, timeoutMs, retryTimeoutMult
 };
 
 export const coordToGtp = (x, y) => {
+  if (!Number.isInteger(x) || !Number.isInteger(y)) {
+    throw new Error(`Invalid coordinate: (${x}, ${y})`);
+  }
+  if (x < 1 || x > GTP_LETTERS.length || y < 1) {
+    throw new Error(`Out-of-range coordinate: (${x}, ${y})`);
+  }
   const letter = GTP_LETTERS[x - 1];
+  if (!letter) {
+    throw new Error(`Invalid GTP x coordinate: ${x}`);
+  }
   return `${letter}${y}`;
 };
 
@@ -517,3 +526,4 @@ export const setupKatagoPosition = async (
   client.lastSetupKomi = komi;
   return true;
 };
+

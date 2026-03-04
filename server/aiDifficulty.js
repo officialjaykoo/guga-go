@@ -66,3 +66,4 @@ export const AI_DIFFICULTY_PARAMS = buildDifficultyParams();
 
 export const getDifficultyParams = (difficulty) =>
   AI_DIFFICULTY_PARAMS[difficulty] || AI_DIFFICULTY_PARAMS.god;
+

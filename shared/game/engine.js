@@ -418,7 +418,15 @@ export function suggestDeadStones(stones) {
 }
 
 export function placeStone(state, x, y) {
-  if (state.over || isOccupied(state.stones, x, y)) {
+  const ix = Number(x);
+  const iy = Number(y);
+  if (
+    state.over ||
+    !Number.isInteger(ix) ||
+    !Number.isInteger(iy) ||
+    !inBounds(ix, iy) ||
+    isOccupied(state.stones, ix, iy)
+  ) {
     return state;
   }
 
@@ -429,8 +437,8 @@ export function placeStone(state, x, y) {
   const color = moveCount < 4 ? "green" : player;
 
   const newStone = {
-    x,
-    y,
+    x: ix,
+    y: iy,
     player,
     color,
     moveNumber: moveCount + 1,
@@ -454,7 +462,7 @@ export function placeStone(state, x, y) {
       over: false,
       score: null,
       moveCount: moveCount + 1,
-      lastMove: { type: "stone", player, x, y },
+      lastMove: { type: "stone", player, x: ix, y: iy },
       boardHashes: [...state.boardHashes, newHash],
     };
   }
@@ -463,7 +471,7 @@ export function placeStone(state, x, y) {
   const toRemove = new Set();
   let capturedCount = 0;
 
-  getNeighbors(x, y).forEach(([nx, ny]) => {
+  getNeighbors(ix, iy).forEach(([nx, ny]) => {
     const neighbor = board.get(`${nx},${ny}`);
     if (!neighbor || neighbor.color === color || neighbor.color === "green") {
       return;
@@ -482,7 +490,7 @@ export function placeStone(state, x, y) {
   }
 
   const boardAfter = buildBoard(stones);
-  const placedStone = boardAfter.get(`${x},${y}`);
+  const placedStone = boardAfter.get(`${ix},${iy}`);
   const selfCheck =
     placedStone && getGroupAndLiberties(boardAfter, placedStone).liberties === 0;
   if (selfCheck) {
@@ -509,7 +517,8 @@ export function placeStone(state, x, y) {
     over: false,
     score: null,
     moveCount: moveCount + 1,
-    lastMove: { type: "stone", player, x, y },
+    lastMove: { type: "stone", player, x: ix, y: iy },
     boardHashes: [...state.boardHashes, newHash],
   };
 }
+

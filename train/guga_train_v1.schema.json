@@ -1,0 +1,38 @@
+﻿{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "guga-train-v1",
+  "type": "object",
+  "required": [
+    "schemaVersion",
+    "experimentId",
+    "gameId",
+    "move",
+    "turn",
+    "policyTarget",
+    "valueTarget",
+    "features",
+    "context"
+  ],
+  "properties": {
+    "schemaVersion": { "const": "guga-train-v1" },
+    "experimentId": { "type": "string" },
+    "gameId": { "type": ["string", "number"] },
+    "move": { "type": "number", "minimum": 1 },
+    "turn": { "type": "string", "enum": ["black", "white"] },
+    "policyTarget": {
+      "oneOf": [
+        { "type": "string" },
+        {
+          "type": "object",
+          "required": ["pass"],
+          "properties": {
+            "pass": { "const": true }
+          }
+        }
+      ]
+    },
+    "valueTarget": { "type": "number", "minimum": 0, "maximum": 1 },
+    "features": { "type": "object" },
+    "context": { "type": "object" }
+  }
+}

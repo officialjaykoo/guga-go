@@ -65,3 +65,4 @@ export default function GameLogView({ title, rows, t = (key) => key }) {
     </div>
   );
 }
+

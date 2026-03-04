@@ -1,4 +1,4 @@
-﻿import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import LoginUI from "./LoginUI";
 import LobbyUI from "./LobbyUI";
 import GameUI from "./GameUI";
@@ -9,8 +9,8 @@ import {
   normalizeLang,
   saveLangPreference,
   tFactory,
-} from "./i18n";
-import { validateName } from "./validation";
+} from "../shared/common/i18n";
+import { validateName } from "../shared/common/validation";
 
 const DEFAULT_LOBBY_STATE = {
   rooms: [],
@@ -107,6 +107,7 @@ export default function AppUI() {
   const wsRef = useRef(null);
   const reconnectRef = useRef(null);
   const reconnectDelayRef = useRef(500);
+  const pendingAuthRef = useRef(null);
   const userIdRef = useRef("");
   const screenRef = useRef("login");
   const currentRoomRef = useRef(null);
@@ -129,14 +130,15 @@ export default function AppUI() {
   const currentRoomData = rooms.find((room) => room.name === currentRoom) || null;
   const effectiveRoom = currentRoomData;
   const lobbyRooms = rooms;
-  const shouldConnect = screen !== "login";
+  const shouldConnect = true;
 
   const send = useCallback((payload) => {
     const ws = wsRef.current;
     if (!ws || ws.readyState !== WebSocket.OPEN) {
-      return;
+      return false;
     }
     ws.send(JSON.stringify(payload));
+    return true;
   }, []);
 
   useEffect(() => {
@@ -192,6 +194,9 @@ export default function AppUI() {
       ws.addEventListener("open", () => {
         reconnectDelayRef.current = 500;
         setConnected(true);
+        if (pendingAuthRef.current) {
+          send(pendingAuthRef.current);
+        }
         const trimmed = userIdRef.current.trim();
         if (!trimmed) return;
         if (screenRef.current === "lobby") {
@@ -212,6 +217,37 @@ export default function AppUI() {
           const data = JSON.parse(event.data);
           if (data?.type === "notice" && typeof data.text === "string") {
             setServerNotice({ text: data.text, at: Date.now() });
+            return;
+          }
+          if (data?.type === "authOk" && typeof data.userId === "string") {
+            const normalized = data.userId.trim();
+            if (!normalized) return;
+            pendingAuthRef.current = null;
+            setUserId(normalized);
+            userIdRef.current = normalized;
+            setScreen("lobby");
+            screenRef.current = "lobby";
+            return;
+          }
+          if (data?.type === "chatEvent") {
+            const scope = String(data.scope || "").trim() || "lobby";
+            const roomId = String(data.roomId || "").trim() || "global";
+            const entry = data.entry;
+            if (!entry || typeof entry !== "object") return;
+            const key = `${scope}:${roomId}`;
+            setLobbyState((prev) => {
+              const channels = prev?.chat?.channels || {};
+              const list = Array.isArray(channels[key]) ? channels[key] : [];
+              return {
+                ...prev,
+                chat: {
+                  channels: {
+                    ...channels,
+                    [key]: [...list, entry].slice(-200),
+                  },
+                },
+              };
+            });
             return;
           }
           if (data?.type === "state") {
@@ -302,13 +338,23 @@ export default function AppUI() {
     const validation = validateName(nextUserId ?? userId);
     if (!validation.ok) return;
     const trimmed = validation.value;
-    if (nextUserId) {
-      setUserId(trimmed);
-      userIdRef.current = trimmed;
-    }
-    setScreen("lobby");
-    screenRef.current = "lobby";
-    send({ type: "enterLobby", userId: trimmed });
+    pendingAuthRef.current = {
+      type: "authLogin",
+      provider: "guest",
+      guestId: trimmed,
+    };
+    send(pendingAuthRef.current);
+  };
+
+  const loginGoogle = (idToken) => {
+    const token = String(idToken || "").trim();
+    if (!token) return;
+    pendingAuthRef.current = {
+      type: "authLogin",
+      provider: "google",
+      idToken: token,
+    };
+    send(pendingAuthRef.current);
   };
 
   const createRoom = (title, ruleset) => {
@@ -446,6 +492,7 @@ export default function AppUI() {
     if (trimmed) {
       send({ type: "logout", userId: trimmed });
     }
+    pendingAuthRef.current = null;
     setCurrentRoom(null);
     setScreen("login");
     setUserId("");
@@ -487,6 +534,7 @@ export default function AppUI() {
       {screen === "login" && (
         <LoginUI
           onGuestEnter={enterLobby}
+          onGoogleLogin={loginGoogle}
           t={t}
         />
       )}
@@ -535,6 +583,8 @@ export default function AppUI() {
     </div>
   );
 }
+
+
 
 
 

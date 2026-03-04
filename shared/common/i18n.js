@@ -1,4 +1,4 @@
-const ko = {
+﻿const ko = {
   login_title: "구가바둑",
   login_placeholder: "아이디",
   guest_rank_label: "급수",

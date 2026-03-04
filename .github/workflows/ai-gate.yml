@@ -1,0 +1,50 @@
+﻿name: ai-gate
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "0 3 * * *"
+  push:
+    branches: [ "main" ]
+
+jobs:
+  gate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+      - run: npm ci
+      - name: Run tests
+        run: npm test
+      - name: Build
+        run: npx vite build
+      - name: Run AI gate
+        run: npm run ai:gate
+      - name: Find latest analysis
+        id: analysis
+        shell: bash
+        run: |
+          file=$(find matches -type f -name 'analysis_*.json' -print 2>/dev/null | sort | tail -n 1 || true)
+          echo "file=$file" >> $GITHUB_OUTPUT
+      - name: Notify gate result
+        if: always() && steps.analysis.outputs.file != ''
+        env:
+          AI_ALERT_WEBHOOK_URL: ${{ secrets.AI_ALERT_WEBHOOK_URL }}
+        run: node scripts/ai_notify.js --analysis "${{ steps.analysis.outputs.file }}"
+      - name: Promote AB rollout
+        if: always() && steps.analysis.outputs.file != ''
+        run: node scripts/ai_ab_promote.js --analysis "${{ steps.analysis.outputs.file }}" --step 10 --minEloLow 0
+      - name: Build runtime metrics summary
+        if: always()
+        run: npm run ai:metrics
+      - name: Runtime guard rollback
+        if: always()
+        run: node scripts/ai_ops_guard.js --minGames 20 --minWinrate 0.48
+      - name: Generate dashboard
+        if: always()
+        run: node scripts/ai_dashboard.js --analysis server/data/ai_runtime_metrics.summary.json --gate "${{ steps.analysis.outputs.file }}"
+      - name: Prune old match artifacts
+        if: always()
+        run: npm run ai:prune

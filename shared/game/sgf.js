@@ -1,4 +1,4 @@
-import { createInitialState, passTurn, placeStone } from "./gameEngine.js";
+import { createInitialState, passTurn, placeStone } from "./engine.js";
 
 const DEFAULT_COLUMNS = 19;
 const DEFAULT_ROWS = 13;
@@ -163,7 +163,11 @@ export const parseSgf = (sgfText) => {
   const setup = {
     black: Array.isArray(root.AB) ? root.AB.slice() : [],
     white: Array.isArray(root.AW) ? root.AW.slice() : [],
+    green: Array.isArray(root.UG) ? root.UG.slice() : [],
   };
+  const playerToMoveRaw = String(root.PL?.[0] || "").trim().toUpperCase();
+  const playerToMove =
+    playerToMoveRaw === "B" ? "black" : playerToMoveRaw === "W" ? "white" : null;
   const moves = [];
 
   nodes.forEach((node, idx) => {
@@ -185,6 +189,7 @@ export const parseSgf = (sgfText) => {
     playerWhite,
     result,
     setup,
+    playerToMove,
     moves,
   };
 };
@@ -265,11 +270,20 @@ export const buildHistoryFromSgf = (parsed, options = {}) => {
 
   (parsed?.setup?.black || []).forEach((value) => pushSetup(value, "black"));
   (parsed?.setup?.white || []).forEach((value) => pushSetup(value, "white"));
+  (parsed?.setup?.green || []).forEach((value) => pushSetup(value, "green"));
 
   if (setupStones.length) {
+    const hasBlackSetup = setupStones.some((stone) => stone.color === "black");
+    const hasWhiteSetup = setupStones.some((stone) => stone.color === "white");
+    const hasGreenSetup = setupStones.some((stone) => stone.color === "green");
+    const inferredTurn =
+      parsed?.playerToMove ||
+      (hasBlackSetup && !hasWhiteSetup && !hasGreenSetup ? "white" : "black");
     state = {
       ...state,
       stones: setupStones,
+      turn: inferredTurn,
+      moveCount: setupStones.length,
       boardHashes: [getBoardHash(setupStones)],
     };
   }
@@ -283,14 +297,21 @@ export const buildHistoryFromSgf = (parsed, options = {}) => {
     if (!point) {
       return { ok: false, error: "invalid_move" };
     }
-    let next = null;
-    const seeded = { ...current, turn: player };
-    if (point.pass) {
-      next = passTurn(seeded);
-    } else {
-      next = placeStone(seeded, point.x, point.y);
+    if (options.strictTurnOrder !== false && current.turn !== player) {
+      return {
+        ok: false,
+        error: "invalid_turn_order",
+        expected: current.turn,
+        found: player,
+      };
     }
-    if (next === seeded) {
+    let next = null;
+    if (point.pass) {
+      next = passTurn(current);
+    } else {
+      next = placeStone(current, point.x, point.y);
+    }
+    if (next === current) {
       return { ok: false, error: "illegal_move" };
     }
     history.push(next);
@@ -327,10 +348,14 @@ export const buildSgfFromHistory = ({
     if (!value) return;
     if (stone.color === "black") {
       ab.push(value);
-    } else if (stone.color === "white" || stone.color === "green") {
+    } else if (stone.color === "white") {
       aw.push(value);
     }
   });
+  const ug = setupStones
+    .filter((stone) => stone.color === "green")
+    .map((stone) => pointToValue(stone.x, stone.y, columns, rows))
+    .filter(Boolean);
 
   const parts = [];
   parts.push("(");
@@ -348,6 +373,9 @@ export const buildSgfFromHistory = ({
   }
   if (aw.length) {
     parts.push(`AW${aw.map((v) => `[${v}]`).join("")}`);
+  }
+  if (ug.length) {
+    parts.push(`UG${ug.map((v) => `[${v}]`).join("")}`);
   }
 
   history.slice(1).forEach((state) => {
@@ -374,3 +402,4 @@ export const buildSgfFromHistory = ({
   parts.push(")");
   return parts.join("");
 };
+

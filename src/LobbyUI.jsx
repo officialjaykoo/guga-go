@@ -4,7 +4,7 @@ import playerBlackIcon from "./img/ui/player_-1.svg";
 import playerWhiteIcon from "./img/ui/player_1.svg";
 import ChatPanelView from "./components/ChatPanelView";
 import RulesPageUI from "./RulesPageUI";
-import { validateName } from "./validation";
+import { validateName } from "../shared/common/validation";
 
 export default function LobbyUI({
   userId,
@@ -256,3 +256,5 @@ export default function LobbyUI({
     </div>
   );
 }
+
+

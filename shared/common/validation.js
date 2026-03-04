@@ -1,4 +1,4 @@
-const allowedPattern = /^[A-Za-z0-9_가-힣]+$/;
+const allowedPattern = /^[A-Za-z0-9_\uAC00-\uD7A3]+$/;
 const blacklistPattern = /[<>{}[\]\\/|'"`;:$%()^*+=!?@#~]/;
 
 export function validateName(value) {
@@ -14,3 +14,4 @@ export function validateName(value) {
   }
   return { ok: true, value: trimmed };
 }
+

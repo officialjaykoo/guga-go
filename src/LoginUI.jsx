@@ -1,5 +1,5 @@
-import React, { useMemo, useState } from "react";
-import { validateName } from "./validation";
+import React, { useEffect, useMemo, useRef, useState } from "react";
+import { validateName } from "../shared/common/validation";
 import blackIcon from "./img/ui/black.svg";
 import whiteIcon from "./img/ui/white.svg";
 
@@ -30,9 +30,13 @@ function reserveGuestId(rank) {
   }
 }
 
-export default function LoginUI({ onGuestEnter, t }) {
+const GOOGLE_GSI_SRC = "https://accounts.google.com/gsi/client";
+
+export default function LoginUI({ onGuestEnter, onGoogleLogin, t }) {
   const [rank, setRank] = useState("1");
   const [error, setError] = useState("");
+  const googleDivRef = useRef(null);
+  const googleClientId = import.meta?.env?.VITE_GOOGLE_CLIENT_ID;
   const rankOptions = useMemo(() => {
     const suffix = t("guest_rank_suffix");
     return Array.from({ length: 18 }, (_, idx) => {
@@ -45,6 +49,47 @@ export default function LoginUI({ onGuestEnter, t }) {
     const next = safeGetCounter(rank) + 1;
     return `${rank}K_GUEST${next}`;
   }, [rank]);
+
+  useEffect(() => {
+    if (!googleClientId || typeof window === "undefined") return;
+    const renderGoogleButton = () => {
+      const g = window.google;
+      if (!g?.accounts?.id || !googleDivRef.current) return;
+      g.accounts.id.initialize({
+        client_id: googleClientId,
+        callback: (resp) => {
+          const credential = String(resp?.credential || "").trim();
+          if (!credential) return;
+          onGoogleLogin?.(credential);
+        },
+      });
+      googleDivRef.current.innerHTML = "";
+      g.accounts.id.renderButton(googleDivRef.current, {
+        theme: "outline",
+        size: "large",
+        width: 260,
+      });
+    };
+    if (window.google?.accounts?.id) {
+      renderGoogleButton();
+      return;
+    }
+    const existing = document.querySelector(`script[src="${GOOGLE_GSI_SRC}"]`);
+    if (existing) {
+      existing.addEventListener("load", renderGoogleButton, { once: true });
+      return () =>
+        existing.removeEventListener("load", renderGoogleButton, { once: true });
+    }
+    const script = document.createElement("script");
+    script.src = GOOGLE_GSI_SRC;
+    script.async = true;
+    script.defer = true;
+    script.onload = renderGoogleButton;
+    document.head.appendChild(script);
+    return () => {
+      script.onload = null;
+    };
+  }, [googleClientId, onGoogleLogin]);
 
   return (
     <div className="login-shell">
@@ -98,8 +143,15 @@ export default function LoginUI({ onGuestEnter, t }) {
             {t("guest_enter")}
           </button>
         </div>
+        {googleClientId ? (
+          <div className="login-actions">
+            <div ref={googleDivRef} />
+          </div>
+        ) : null}
         {error && <div className="login-error">{error}</div>}
       </div>
     </div>
   );
 }
+
+

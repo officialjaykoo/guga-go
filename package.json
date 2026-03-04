@@ -4,10 +4,11 @@
   "version": "0.0.1",
   "type": "module",
   "scripts": {
-    "dev": "vite",
-    "server": "node server/ai_server.js",
     "dev:all": "node server/ai_server.js & vite",
-    "docs:generate": "node scripts/generate_docs.js"
+    "ai:selfplay:guga": "node scripts/match/katago_selfplay_guga.js --games 100 --workers 2 --simFast 1 --analysis 0 --dataset 1 --out matches/katago_selfplay_guga",
+    "ai:selfplay:model": "node scripts/match/model_selfplay_guga.js --matches matches/katago_selfplay_guga --out selfplay_runs/model_selfplay_guga",
+    "server:independent": "node scripts/train/start_independent_server.js",
+    "test": "node --test \"required_guardrails/*.guard.js\""
   },
   "dependencies": {
     "react": "^18.2.0",

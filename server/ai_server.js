@@ -1,34 +1,54 @@
 ﻿import { WebSocketServer } from "ws";
+import fs from "node:fs";
+import path from "node:path";
 import {
   GtpClient,
   gtpToCoord,
   sendWithRetry as sendWithRetryBase,
   setupKatagoPosition,
-} from "../shared/katagoGtp.js";
+} from "../shared/ai/katagoGtp.js";
 import {
   createInitialState,
   passTurn,
   placeStone,
   resign,
   scoreNow,
-} from "../src/gameEngine.js";
-import * as aiStyleRouter from "./aiStyle_dispatcher.js";
-import * as nativeStyle from "./aiStyle_n4tive.js";
-import * as ganghandolStyle from "./aiStyle_ganghandol_heuristic.js";
+} from "../shared/game/engine.js";
+import {
+  loadIndependentModel,
+  pickIndependentMove,
+} from "../shared/ai/independentAi.js";
 import { getDifficultyParams } from "./aiDifficulty.js";
+import { validateName } from "../shared/common/validation.js";
+import { initDb, upsertUser } from "./experimental/db.js";
+import { normalizeGuest, verifyGoogleIdToken } from "./experimental/auth.js";
+import { validateInboundMessage } from "./messageSchema.js";
 
+// -----------------------------------------------------------------------------
+// Core Configuration
+// -----------------------------------------------------------------------------
 const PORT = Number(process.env.PORT) || 5174;
 const BOARD = { columns: 19, rows: 13 };
 const AI_LABELS = {
-  intro: "입문",
-  low: "하수",
-  mid: "중수",
-  high: "고수",
-  master: "국수",
-  god: "신",
+  intro: "Beginner",
+  low: "Novice",
+  mid: "Intermediate",
+  high: "Advanced",
+  master: "Master",
+  god: "God",
 };
+const VALID_RULESETS = new Set(["korean", "japanese", "chinese"]);
+const VALID_DIFFICULTIES = new Set(Object.keys(AI_LABELS));
+const MAX_CHAT_TEXT = 300;
+const MAX_ROOM_TITLE = 32;
+const MAX_HISTORY_LENGTH = BOARD.columns * BOARD.rows + 20;
+const BROADCAST_COALESCE_MS =
+  Number(process.env.BROADCAST_COALESCE_MS) || 100;
 let aiCounter = 0;
 
+// -----------------------------------------------------------------------------
+// In-Memory Server State
+// -----------------------------------------------------------------------------
 const state = {
   rooms: [],
   waitingUsers: [],
@@ -36,7 +56,11 @@ const state = {
   chat: { channels: {} },
   updatedAt: Date.now(),
 };
+initDb();
 
+// -----------------------------------------------------------------------------
+// Engine / KataGo Runtime Settings
+// -----------------------------------------------------------------------------
 const TIMER_PERIOD_MS = 30000;
 const TIMER_MAX_LIVES = 3;
 const AI_TURN_PERIOD_MS = Number(process.env.AI_TURN_PERIOD_MS) || 7000;
@@ -65,54 +89,44 @@ const KATAGO_MAX_TIMEOUTS = Number(process.env.KATAGO_MAX_TIMEOUTS) || 10;
 const KATAGO_RETRY_TIMEOUT_MULT =
   Number(process.env.KATAGO_RETRY_TIMEOUT_MULT) || 2;
 const KATAGO_GREEN_AS = (process.env.KATAGO_GREEN_AS || "black").toLowerCase();
-const KATAGO_CANDIDATE_COUNT =
-  Number(process.env.KATAGO_CANDIDATE_COUNT) || 10;
-const GANGHANDOL_AI_NAME = "GanghanDol";
-const normalizeStyleKeyBase = (value) => {
-  const key = String(value || "native").trim().toLowerCase();
-  if (key === "pure") return "native";
-  if (key === "n4tive") return "native";
-  if (key === "native") return "native";
-  return key;
-};
-const AI_STYLE_MODE = normalizeStyleKeyBase(
-  process.env.AI_STYLE_MODE || "native"
+const AI_ENGINE_MODE = String(process.env.AI_ENGINE_MODE || "katago")
+  .trim()
+  .toLowerCase();
+const AI_IS_INDEPENDENT = AI_ENGINE_MODE === "independent";
+const AI_INDEPENDENT_MODEL_PATH = path.resolve(
+  process.cwd(),
+  process.env.AI_INDEPENDENT_MODEL_PATH || "server/data/independent_model_v2.json"
 );
-const AI_STYLE_BLACK = normalizeStyleKeyBase(
-  process.env.AI_STYLE_BLACK || "native"
+const AI_RUNTIME_METRICS_PATH = path.resolve(
+  process.cwd(),
+  process.env.AI_RUNTIME_METRICS_PATH || "server/data/ai_runtime_metrics.jsonl"
 );
-const AI_STYLE_WHITE = normalizeStyleKeyBase(
-  process.env.AI_STYLE_WHITE || "ganghandol"
-);
+const AI_STYLE_MODE = "native";
+const AI_STYLE_BLACK = "native";
+const AI_STYLE_WHITE = "native";
+const AI_STYLE_LABEL = "N4TIVE";
 const KATAGO_RULES_COMMAND = String(
   process.env.KATAGO_RULES_COMMAND || "auto"
 )
   .trim()
   .toLowerCase();
-const STYLE_MODULES = {
-  native: nativeStyle,
-  n4tive: nativeStyle,
-  pure: nativeStyle,
-  ganghandol: ganghandolStyle,
-  default: aiStyleRouter,
+const appendRuntimeMetric = (payload) => {
+  try {
+    const dir = path.dirname(AI_RUNTIME_METRICS_PATH);
+    fs.mkdirSync(dir, { recursive: true });
+    fs.appendFileSync(
+      AI_RUNTIME_METRICS_PATH,
+      `${JSON.stringify(payload)}\n`,
+      "utf8"
+    );
+  } catch {
+    // ignore metric write failures
+  }
 };
-const STYLE_DISPLAY_NAMES = {
-  native: "N4TIVE",
-  n4tive: "N4TIVE",
-  pure: "N4TIVE",
-  ganghandol: GANGHANDOL_AI_NAME,
-};
-const normalizeStyleKey = (value, fallback) =>
-  normalizeStyleKeyBase(String(value || fallback || "").trim().toLowerCase());
-const getStyleModule = (aiConfig, fallback) => {
-  const key = normalizeStyleKey(aiConfig?.styleMode, fallback);
-  return STYLE_MODULES[key] || STYLE_MODULES.default;
-};
-const getStyleKey = (aiConfig, fallback) =>
-  normalizeStyleKey(aiConfig?.styleMode, fallback);
-const getStyleDisplayName = (key, fallback) =>
-  STYLE_DISPLAY_NAMES[key] || fallback;
 
+// -----------------------------------------------------------------------------
+// KataGo Client Lifecycle
+// -----------------------------------------------------------------------------
 const getModelLabel = () => {
   if (!KATAGO_MODEL) return "model";
   const trimmed = String(KATAGO_MODEL).replace(/\\/g, "/");
@@ -136,6 +150,8 @@ const setupKatagoPositionSafe = (client, history, ruleset, komiInternal) =>
 let katagoClient = null;
 let katagoAvailable = true;
 let katagoChain = Promise.resolve();
+let independentModel = null;
+let independentModelMtime = 0;
 
 const withKatagoLock = (task) => {
   const run = () => Promise.resolve().then(task);
@@ -207,58 +223,6 @@ const adjustScoreLead = (scoreLead, displayKomi, internalKomi) => {
   const display = Number.isFinite(displayKomi) ? displayKomi : 0;
   const internal = Number.isFinite(internalKomi) ? internalKomi : display;
   return scoreLead + (internal - display);
-};
-
-const extractCandidateMovesFromLines = (lines, columns, rows) => {
-  if (!Array.isArray(lines)) return [];
-  for (const line of lines) {
-    const trimmed = line.trim();
-    if (!trimmed.startsWith("{")) continue;
-    try {
-      const parsed = JSON.parse(trimmed);
-      const infos = parsed?.moveInfos || parsed?.analysis?.moveInfos;
-      if (!Array.isArray(infos)) continue;
-      const candidates = [];
-      infos.forEach((info) => {
-        const coord = gtpToCoord(info?.move);
-        if (!coord) return;
-        if (coord === "pass") {
-          candidates.push({
-            pass: true,
-            scoreLead: Number.isFinite(info?.scoreLead) ? info.scoreLead : null,
-            winrate: Number.isFinite(info?.winrate)
-              ? info.winrate
-              : Number.isFinite(info?.winRate)
-                ? info.winRate
-                : null,
-            visits: Number.isFinite(info?.visits) ? info.visits : null,
-            order: candidates.length,
-          });
-          return;
-        }
-        if (!coord.x || !coord.y) return;
-        if (coord.x < 1 || coord.x > columns || coord.y < 1 || coord.y > rows) {
-          return;
-        }
-        candidates.push({
-          x: coord.x,
-          y: coord.y,
-          scoreLead: Number.isFinite(info?.scoreLead) ? info.scoreLead : null,
-          winrate: Number.isFinite(info?.winrate)
-            ? info.winrate
-            : Number.isFinite(info?.winRate)
-              ? info.winRate
-              : null,
-          visits: Number.isFinite(info?.visits) ? info.visits : null,
-          order: candidates.length,
-        });
-      });
-      return candidates;
-    } catch {
-      // ignore parse errors
-    }
-  }
-  return [];
 };
 
 const applyKatagoDifficulty = async (client, difficulty) => {
@@ -511,44 +475,6 @@ const katagoGenMove = (history, ruleset, color, difficulty, komiDisplay) =>
     return parsed;
   });
 
-const katagoGenMoveCandidates = (
-  history,
-  ruleset,
-  color,
-  stones,
-  difficulty,
-  komiDisplay
-) =>
-  withKatagoLock(async () => {
-    const client = getKataGoClient();
-    if (!client) return null;
-    const displayKomi = Number.isFinite(komiDisplay)
-      ? komiDisplay
-      : getKomiForRuleset(ruleset);
-    const internalKomi = getInternalKomi(displayKomi);
-    const ok = await setupKatagoPositionSafe(
-      client,
-      history,
-      ruleset,
-      internalKomi
-    );
-    if (!ok) return null;
-    await applyKatagoDifficulty(client, difficulty);
-    const response = await client.send(
-      `kata-search_analyze ${color} ownership true`,
-      KATAGO_ANALYSIS_TIMEOUT_MS
-    );
-    const candidates = extractCandidateMovesFromLines(
-      response.lines,
-      BOARD.columns,
-      BOARD.rows
-    );
-    return candidates.map((entry) => ({
-      ...entry,
-      scoreLead: adjustScoreLead(entry.scoreLead, displayKomi, internalKomi),
-    }));
-  });
-
 const katagoAnalyze = (history, ruleset, color, stones, difficulty, komiDisplay) =>
   withKatagoLock(async () => {
     const client = getKataGoClient();
@@ -583,11 +509,91 @@ const katagoAnalyze = (history, ruleset, color, stones, difficulty, komiDisplay)
   });
 
 const normalizeUser = (value) => String(value || "").trim();
+const normalizeText = (value, maxLen = 200) =>
+  String(value || "")
+    .replace(/\s+/g, " ")
+    .trim()
+    .slice(0, maxLen);
+const normalizeRuleset = (value, fallback = "korean") => {
+  const candidate = normalizeUser(value).toLowerCase();
+  return VALID_RULESETS.has(candidate) ? candidate : fallback;
+};
+const normalizeDifficulty = (value, fallback = "god") => {
+  const candidate = normalizeUser(value).toLowerCase();
+  return VALID_DIFFICULTIES.has(candidate) ? candidate : fallback;
+};
+const parseUserId = (value) => {
+  const result = validateName(value);
+  return result.ok ? result.value : "";
+};
+const parseCoord = (value, max) => {
+  const numeric = Number(value);
+  if (!Number.isInteger(numeric)) return null;
+  if (numeric < 1 || numeric > max) return null;
+  return numeric;
+};
+const getClientSessionUserId = (ws, clientsMap) =>
+  parseUserId(clientsMap.get(ws)?.userId);
+const buildUsedUserIdSet = (clientsMap) => {
+  const used = new Set();
+  state.waitingUsers.forEach((id) => used.add(id));
+  state.rooms.forEach((room) => {
+    room.players.forEach((id) => used.add(id));
+    (room.spectators || []).forEach((id) => used.add(id));
+    if (room.owner) used.add(room.owner);
+  });
+  clientsMap.forEach((info) => {
+    const id = parseUserId(info?.userId);
+    if (id) used.add(id);
+  });
+  return used;
+};
+const assignUniqueUserId = (baseId, clientsMap) => {
+  const base = parseUserId(baseId);
+  if (!base) return "";
+  const used = buildUsedUserIdSet(clientsMap);
+  if (!used.has(base)) return base;
+  for (let i = 2; i <= 9999; i += 1) {
+    const next = `${base}_${i}`;
+    if (!used.has(next)) return next;
+  }
+  return "";
+};
+const isUserInRoom = (room, userId) => {
+  if (!room || !userId) return false;
+  if (room.players.includes(userId)) return true;
+  if (Array.isArray(room.spectators) && room.spectators.includes(userId)) return true;
+  return false;
+};
+const isValidHistoryPayload = (history) => {
+  if (!Array.isArray(history)) return false;
+  if (history.length < 1 || history.length > MAX_HISTORY_LENGTH) return false;
+  return history.every((stateItem) => {
+    if (!stateItem || typeof stateItem !== "object") return false;
+    const stones = Array.isArray(stateItem.stones) ? stateItem.stones : [];
+    if (stones.length > BOARD.columns * BOARD.rows) return false;
+    return stones.every((stone) => {
+      const x = parseCoord(stone?.x, BOARD.columns);
+      const y = parseCoord(stone?.y, BOARD.rows);
+      if (!x || !y) return false;
+      const color = normalizeUser(stone?.color).toLowerCase();
+      return color === "black" || color === "white" || color === "green";
+    });
+  });
+};
 
 const sendNotice = (ws, text) => {
   if (!ws || ws.readyState !== 1) return;
   try {
     ws.send(JSON.stringify({ type: "notice", text }));
+  } catch {
+    // ignore send failures
+  }
+};
+const sendAuthOk = (ws, payload) => {
+  if (!ws || ws.readyState !== 1) return;
+  try {
+    ws.send(JSON.stringify({ type: "authOk", ...payload }));
   } catch {
     // ignore send failures
   }
@@ -680,13 +686,7 @@ const pushNotice = (room, text) => {
   room.game.notifications = [...room.game.notifications, entry].slice(-30);
 };
 
-const makeAiName = (styleKey) => {
-  const styleLabel = getStyleDisplayName(
-    normalizeStyleKey(styleKey, AI_STYLE_MODE),
-    "AI"
-  );
-  return styleLabel;
-};
+const makeAiName = () => AI_STYLE_LABEL;
 
 const isAiTurn = (room, color) => {
   if (!room.ai?.enabled) return false;
@@ -705,6 +705,64 @@ const getAiConfig = (room, color) => {
 const getLeadForAi = (analysis, aiColor) => {
   if (!analysis || !Number.isFinite(analysis.scoreLead)) return null;
   return aiColor === "black" ? analysis.scoreLead : -analysis.scoreLead;
+};
+
+const getIndependentModel = () => {
+  try {
+    const stat = fs.statSync(AI_INDEPENDENT_MODEL_PATH);
+    if (!independentModel || stat.mtimeMs !== independentModelMtime) {
+      independentModel = loadIndependentModel(AI_INDEPENDENT_MODEL_PATH);
+      independentModelMtime = stat.mtimeMs;
+    }
+  } catch {
+    if (!independentModel) {
+      independentModel = loadIndependentModel(AI_INDEPENDENT_MODEL_PATH);
+      independentModelMtime = 0;
+    }
+  }
+  return independentModel;
+};
+const getWinnerColorFromState = (stateItem) => {
+  const score = stateItem?.score;
+  if (score?.winner === "black" || score?.winner === "white") {
+    return score.winner;
+  }
+  if (Number.isFinite(score?.black) && Number.isFinite(score?.white)) {
+    if (score.black > score.white) return "black";
+    if (score.white > score.black) return "white";
+  }
+  return null;
+};
+const maybeLogAiGameResult = (room, now = Date.now()) => {
+  if (!room?.ai?.enabled || !room?.game?.history?.length) return;
+  if (room.game.resultLoggedAt) return;
+  const current = room.game.history[room.game.history.length - 1];
+  if (!current?.over) return;
+  const payload = {
+    ts: now,
+    room: room.name,
+    ruleset: room.ruleset || null,
+    ai: {
+      vsAi: Boolean(room.ai?.vsAi),
+      difficulty: room.ai?.difficulty || null,
+      styleMode: room.ai?.styleMode || null,
+      blackStyle: room.ai?.black?.styleMode || null,
+      whiteStyle: room.ai?.white?.styleMode || null,
+    },
+    result: {
+      winner: getWinnerColorFromState(current),
+      reason: current?.score?.reason || null,
+      black: Number.isFinite(current?.score?.black) ? current.score.black : null,
+      white: Number.isFinite(current?.score?.white) ? current.score.white : null,
+      moveCount: Math.max(0, room.game.history.length - 1),
+      durationMs:
+        Number.isFinite(room.game.startedAt) && room.game.startedAt > 0
+          ? Math.max(0, now - room.game.startedAt)
+          : null,
+    },
+  };
+  appendRuntimeMetric(payload);
+  room.game.resultLoggedAt = now;
 };
 
 const shouldAiResign = (state, aiColor, analysis) => {
@@ -758,105 +816,52 @@ const pickRandomLegalState = (state) => {
 };
 
 const requestAiMove = async (room, current) => {
+  if (AI_IS_INDEPENDENT) {
+    try {
+      const aiConfig = getAiConfig(room, current.turn);
+      const difficulty = aiConfig?.difficulty || room.ai?.difficulty || "god";
+      const model = getIndependentModel();
+      const move = pickIndependentMove(current, {
+        model,
+        board: BOARD,
+        difficulty,
+      });
+      if (move === "pass" || move?.pass) return passTurn(current);
+      if (move && Number.isFinite(move.x) && Number.isFinite(move.y)) {
+        const placed = placeStone(current, move.x, move.y);
+        if (placed !== current) return placed;
+      }
+      return pickRandomLegalState(current);
+    } catch (err) {
+      console.warn("[independent] move error", err.message);
+      return pickRandomLegalState(current);
+    }
+  }
   if (!KATAGO_ENABLED || !katagoAvailable) {
     console.warn("[katago] not configured");
     return null;
   }
   try {
-      const aiConfig = getAiConfig(room, current.turn);
-      const difficulty = aiConfig?.difficulty || room.ai?.difficulty || "god";
-      const styleKey = getStyleKey(aiConfig, AI_STYLE_MODE);
-      const styleModule = getStyleModule(aiConfig, AI_STYLE_MODE);
-      const isPureKata = styleKey === "native";
-      const isGanghanDolStyle = styleKey === "ganghandol";
-      const komiDisplay = Number.isFinite(current?.komi)
-        ? current.komi
-        : getKomiForRuleset(current.ruleset);
-      const moveCount = room?.game?.history?.length
-        ? room.game.history.length - 1
-        : 0;
-      if (!isPureKata && !isGanghanDolStyle && styleModule?.pickOpeningMove) {
-        const openingMove = styleModule.pickOpeningMove(current, {
-          columns: BOARD.columns,
-          rows: BOARD.rows,
-          moveCount,
-          analysis: room.game.analysis,
-        });
-        if (openingMove) {
-          const placed = placeStone(current, openingMove.x, openingMove.y);
-          if (placed !== current) return placed;
-        }
-      }
-      if (isGanghanDolStyle) {
-        const candidates = await katagoGenMoveCandidates(
-          room.game.history,
-          current.ruleset,
-          current.turn,
-          current.stones || [],
-          difficulty,
-          komiDisplay
-        );
-        if (candidates && candidates.length) {
-          const shortlist = candidates.slice(0, KATAGO_CANDIDATE_COUNT);
-          const adjusted = styleModule?.pickCandidateMove?.(current, shortlist, {
-            columns: BOARD.columns,
-            rows: BOARD.rows,
-            aiColor: current.turn,
-            analysis: room.game.analysis,
-          });
-          if (adjusted) {
-            const placed = placeStone(current, adjusted.x, adjusted.y);
-            if (placed !== current) return placed;
-          }
-        }
-      }
-      const move = await katagoGenMove(
-        room.game.history,
-        current.ruleset,
-        current.turn,
-        difficulty,
-        komiDisplay
-      );
-        if (move === "pass") return passTurn(current);
-        if (move === "resign") return resign(current, current.turn);
-        if (move && move.x && move.y) {
-          if (
-            !isPureKata &&
-            !isGanghanDolStyle &&
-            styleModule?.pickStyleOverrideMove
-          ) {
-            const styled = styleModule.pickStyleOverrideMove(current, move, {
-              columns: BOARD.columns,
-              rows: BOARD.rows,
-              moveCount,
-              analysis: room.game.analysis,
-            });
-            if (styled) {
-              const placed = placeStone(current, styled.x, styled.y);
-              if (placed !== current) return placed;
-            }
-          }
-          const placed = placeStone(current, move.x, move.y);
-          if (placed !== current) return placed;
-        }
-      if (
-        !isPureKata &&
-        !isGanghanDolStyle &&
-        styleModule?.pickStyleFallbackMove
-      ) {
-        const fallback = styleModule.pickStyleFallbackMove(current, {
-          columns: BOARD.columns,
-          rows: BOARD.rows,
-          moveCount,
-          analysis: room.game.analysis,
-        });
-        if (fallback) {
-          const placed = placeStone(current, fallback.x, fallback.y);
-          if (placed !== current) return placed;
-        }
-      }
-      console.warn("[ai] no KataGo move; using random legal fallback");
-      return pickRandomLegalState(current);
+    const aiConfig = getAiConfig(room, current.turn);
+    const difficulty = aiConfig?.difficulty || room.ai?.difficulty || "god";
+    const komiDisplay = Number.isFinite(current?.komi)
+      ? current.komi
+      : getKomiForRuleset(current.ruleset);
+    const move = await katagoGenMove(
+      room.game.history,
+      current.ruleset,
+      current.turn,
+      difficulty,
+      komiDisplay
+    );
+    if (move === "pass") return passTurn(current);
+    if (move === "resign") return resign(current, current.turn);
+    if (move && move.x && move.y) {
+      const placed = placeStone(current, move.x, move.y);
+      if (placed !== current) return placed;
+    }
+    console.warn("[ai] no KataGo move; using random legal fallback");
+    return pickRandomLegalState(current);
   } catch (err) {
     console.warn("[katago] move error", err.message);
     console.warn("[ai] move failed; using random legal fallback");
@@ -865,6 +870,7 @@ const requestAiMove = async (room, current) => {
 };
 
 const requestAnalysis = async (room, current) => {
+  if (AI_IS_INDEPENDENT) return null;
   if (!KATAGO_ENABLED || !KATAGO_ANALYSIS_ENABLED || !katagoAvailable) {
     return null;
   }
@@ -898,7 +904,8 @@ const requestAnalysis = async (room, current) => {
   };
 };
 
-const broadcastState = (wss) => {
+let broadcastTimer = null;
+const flushBroadcastState = (wss) => {
   state.updatedAt = Date.now();
   const payload = JSON.stringify({
     type: "state",
@@ -911,6 +918,38 @@ const broadcastState = (wss) => {
     }
   });
 };
+const broadcastState = (wss, { immediate = false } = {}) => {
+  if (immediate) {
+    if (broadcastTimer) {
+      clearTimeout(broadcastTimer);
+      broadcastTimer = null;
+    }
+    flushBroadcastState(wss);
+    return;
+  }
+  if (broadcastTimer) return;
+  broadcastTimer = setTimeout(() => {
+    broadcastTimer = null;
+    flushBroadcastState(wss);
+  }, BROADCAST_COALESCE_MS);
+};
+const emitChatEvent = (wss, clientsMap, scope, roomId, entry) => {
+  const payload = JSON.stringify({
+    type: "chatEvent",
+    scope,
+    roomId,
+    entry,
+  });
+  wss.clients.forEach((clientWs) => {
+    if (clientWs.readyState !== 1) return;
+    if (scope === "game") {
+      const room = getRoom(roomId);
+      const clientUser = getClientSessionUserId(clientWs, clientsMap);
+      if (!room || !isUserInRoom(room, clientUser)) return;
+    }
+    clientWs.send(payload);
+  });
+};
 
 const wss = new WebSocketServer({ port: PORT });
 const clients = new Map();
@@ -919,55 +958,123 @@ wss.on("connection", (ws) => {
   clients.set(ws, { userId: "" });
   ws.send(JSON.stringify({ type: "state", state, serverTime: Date.now() }));
 
-  ws.on("message", (raw) => {
-    let message;
+  ws.on("message", async (raw) => {
+    let parsed;
     try {
-      message = JSON.parse(raw.toString());
+      parsed = JSON.parse(raw.toString());
     } catch {
       return;
     }
-
-    const type = message?.type;
-    const userId = normalizeUser(message?.userId);
-    const prevUserId = normalizeUser(clients.get(ws)?.userId);
-    if (userId) {
-      if (prevUserId && prevUserId !== userId) {
-        removeUserEverywhere(prevUserId, false, { preserveAiRooms: true, reason: "userIdChange" });
-      }
-      clients.set(ws, { userId });
+    const inbound = validateInboundMessage(parsed);
+    if (!inbound.ok) {
+      sendNotice(ws, "Invalid request format.");
+      return;
     }
+    const message = inbound.message;
+
+    const type = normalizeUser(message?.type);
+    const claimedUserId = parseUserId(message?.userId);
+    const sessionUserId = parseUserId(clients.get(ws)?.userId);
 
     if (!type) {
       return;
     }
 
-    if (type === "hello") {
-      if (userId) {
-        ensureWaiting(userId);
-        broadcastState(wss);
+    if (type === "authLogin") {
+      const provider = normalizeUser(message?.provider).toLowerCase();
+      let profile = null;
+      if (provider === "guest") {
+        profile = normalizeGuest(message?.guestId);
+      } else if (provider === "google") {
+        profile = await verifyGoogleIdToken(message?.idToken);
       }
-      return;
-    }
-
-    if (!userId) {
+      if (!profile) {
+        sendNotice(ws, "Login failed: invalid authentication payload.");
+        return;
+      }
+      const resolvedUserId = assignUniqueUserId(profile.userId || profile.name, clients);
+      if (!resolvedUserId) {
+        sendNotice(ws, "Login failed: could not allocate a user ID.");
+        return;
+      }
+      clients.forEach((info, clientWs) => {
+        if (clientWs === ws) return;
+        if (parseUserId(info?.userId) !== resolvedUserId) return;
+        clients.set(clientWs, { userId: "" });
+        sendNotice(clientWs, "A new session for this account connected. Closing this session.");
+      });
+      clients.set(ws, { userId: resolvedUserId });
+      upsertUser({
+        ...profile,
+        id: profile.id || `${provider}:${resolvedUserId}`,
+        name: resolvedUserId,
+      });
+      removeUserEverywhere(resolvedUserId, true, {
+        preserveAiRooms: true,
+        reason: "authLogin",
+      });
+      sendAuthOk(ws, {
+        userId: resolvedUserId,
+        provider: profile.provider || provider,
+      });
+      broadcastState(wss, { immediate: true });
       return;
     }
 
     if (type === "enterLobby") {
-      removeUserEverywhere(userId, true, { preserveAiRooms: true, reason: "enterLobby" });
+      if (!claimedUserId) {
+        sendNotice(ws, "Invalid user ID format.");
+        return;
+      }
+      if (sessionUserId && sessionUserId !== claimedUserId) {
+        sendNotice(ws, "Changing the session user is not allowed.");
+        return;
+      }
+      clients.forEach((info, clientWs) => {
+        if (clientWs === ws) return;
+        if (parseUserId(info?.userId) !== claimedUserId) return;
+        clients.set(clientWs, { userId: "" });
+        sendNotice(clientWs, "A new session for this account connected. Closing this session.");
+      });
+      clients.set(ws, { userId: claimedUserId });
+      const profile = normalizeGuest(claimedUserId);
+      if (profile) {
+        upsertUser(profile);
+      }
+      removeUserEverywhere(claimedUserId, true, {
+        preserveAiRooms: true,
+        reason: "enterLobby",
+      });
+      broadcastState(wss);
+      return;
+    }
+
+    const userId = sessionUserId;
+    if (!userId) {
+      sendNotice(ws, "Enter the lobby first.");
+      return;
+    }
+    if (claimedUserId && claimedUserId !== userId) {
+      sendNotice(ws, "Session user does not match request user.");
+      return;
+    }
+
+    if (type === "hello") {
+      ensureWaiting(userId);
       broadcastState(wss);
       return;
     }
 
     if (type === "createRoom") {
-      const title = normalizeUser(message?.title) || "Room";
+      const title = normalizeText(message?.title, MAX_ROOM_TITLE) || "Room";
+      const ruleset = normalizeRuleset(message?.ruleset, "korean");
       removeUserEverywhere(userId, false, { preserveAiRooms: true, reason: "createRoom" });
       const roomName = `[${state.nextRoomId}] ${title}`;
       state.nextRoomId += 1;
       state.rooms.push({
         name: roomName,
         players: [userId],
-        ruleset: message?.ruleset || "korean",
+        ruleset,
         status: "waiting",
         owner: userId,
         spectators: [],
@@ -1080,6 +1187,8 @@ wss.on("connection", (ws) => {
             undoUsed: false,
             undoRequests: { black: 0, white: 0 },
             notifications: [],
+            startedAt: Date.now(),
+            resultLoggedAt: null,
           },
         };
       });
@@ -1089,20 +1198,24 @@ wss.on("connection", (ws) => {
 
     if (type === "startAiGame") {
       const roomName = normalizeUser(message?.roomName);
-      const difficulty = normalizeUser(message?.difficulty) || "god";
+      const difficulty = normalizeDifficulty(message?.difficulty, "god");
       if (!roomName) return;
-      if (!KATAGO_ENABLED || !katagoAvailable) {
+      if (!AI_IS_INDEPENDENT && (!KATAGO_ENABLED || !katagoAvailable)) {
         console.warn("[katago] startAiGame ignored: not configured");
         sendNotice(
           ws,
-          "KataGo 설정이 없습니다. KATAGO_PATH/KATAGO_CONFIG/KATAGO_MODEL을 먼저 설정하세요."
+          "KataGo is not configured. Set KATAGO_PATH/KATAGO_CONFIG/KATAGO_MODEL first."
         );
         return;
       }
-      if (BOARD.columns !== BOARD.rows && !KATAGO_ALLOW_RECT) {
+      if (
+        !AI_IS_INDEPENDENT &&
+        BOARD.columns !== BOARD.rows &&
+        !KATAGO_ALLOW_RECT
+      ) {
         sendNotice(
           ws,
-          "현재 19x13 보드는 KataGo에서 제한됩니다. KATAGO_ALLOW_RECT=1 설정이 필요합니다."
+          "Current 19x13 board is restricted by KataGo. Set KATAGO_ALLOW_RECT=1."
         );
         return;
       }
@@ -1111,8 +1224,8 @@ wss.on("connection", (ws) => {
         if (room.owner !== userId) return room;
         if (room.players.length < 1) return room;
         if (room.status === "playing") return room;
-        const styleMode = normalizeStyleKey(message?.styleMode, AI_STYLE_MODE);
-        const aiName = makeAiName(styleMode);
+        const styleMode = AI_STYLE_MODE;
+        const aiName = makeAiName();
         const shouldRandomize =
           message?.randomizeColors === undefined
             ? true
@@ -1164,6 +1277,8 @@ wss.on("connection", (ws) => {
             undoUsed: false,
             undoRequests: { black: 0, white: 0 },
             notifications: [],
+            startedAt: Date.now(),
+            resultLoggedAt: null,
           },
         };
       });
@@ -1173,20 +1288,24 @@ wss.on("connection", (ws) => {
 
     if (type === "startAiVsAiGame") {
       const roomName = normalizeUser(message?.roomName);
-      const difficulty = normalizeUser(message?.difficulty) || "god";
+      const difficulty = normalizeDifficulty(message?.difficulty, "god");
       if (!roomName) return;
-      if (!KATAGO_ENABLED || !katagoAvailable) {
+      if (!AI_IS_INDEPENDENT && (!KATAGO_ENABLED || !katagoAvailable)) {
         console.warn("[katago] startAiVsAiGame ignored: not configured");
         sendNotice(
           ws,
-          "KataGo 설정이 없습니다. KATAGO_PATH/KATAGO_CONFIG/KATAGO_MODEL을 먼저 설정하세요."
+          "KataGo is not configured. Set KATAGO_PATH/KATAGO_CONFIG/KATAGO_MODEL first."
         );
         return;
       }
-      if (BOARD.columns !== BOARD.rows && !KATAGO_ALLOW_RECT) {
+      if (
+        !AI_IS_INDEPENDENT &&
+        BOARD.columns !== BOARD.rows &&
+        !KATAGO_ALLOW_RECT
+      ) {
         sendNotice(
           ws,
-          "현재 19x13 보드는 KataGo에서 제한됩니다. KATAGO_ALLOW_RECT=1 설정이 필요합니다."
+          "Current 19x13 board is restricted by KataGo. Set KATAGO_ALLOW_RECT=1."
         );
         return;
       }
@@ -1194,14 +1313,8 @@ wss.on("connection", (ws) => {
         if (room.name !== roomName) return room;
         if (room.owner !== userId) return room;
         if (room.status === "playing") return room;
-        let blackStyle = normalizeStyleKey(
-          message?.blackStyleMode,
-          AI_STYLE_BLACK
-        );
-        let whiteStyle = normalizeStyleKey(
-          message?.whiteStyleMode,
-          AI_STYLE_WHITE
-        );
+        let blackStyle = AI_STYLE_BLACK;
+        let whiteStyle = AI_STYLE_WHITE;
         const shouldRandomize =
           message?.randomizeColors === undefined
             ? true
@@ -1213,8 +1326,8 @@ wss.on("connection", (ws) => {
             whiteStyle = tmp;
           }
         }
-        const blackName = makeAiName(blackStyle);
-        const whiteName = makeAiName(whiteStyle);
+        const blackName = makeAiName();
+        const whiteName = makeAiName();
           return {
             ...room,
             status: "playing",
@@ -1261,6 +1374,8 @@ wss.on("connection", (ws) => {
             undoUsed: false,
             undoRequests: { black: 0, white: 0 },
             notifications: [],
+            startedAt: Date.now(),
+            resultLoggedAt: null,
           },
         };
       });
@@ -1272,6 +1387,10 @@ wss.on("connection", (ws) => {
       const roomName = normalizeUser(message?.roomName);
       const history = Array.isArray(message?.history) ? message.history : null;
       if (!roomName || !history || history.length === 0) return;
+      if (!isValidHistoryPayload(history)) {
+        sendNotice(ws, "Invalid game record format.");
+        return;
+      }
       const room = getRoom(roomName);
       if (!room || room.owner !== userId) {
         return;
@@ -1279,7 +1398,7 @@ wss.on("connection", (ws) => {
       const review = message?.review !== false;
       const prevAi = room.ai;
       const ruleset =
-        normalizeUser(message?.ruleset) ||
+        normalizeRuleset(message?.ruleset, room.ruleset || "korean") ||
         room.ruleset ||
         "korean";
       const komi = Number.isFinite(Number(message?.komi))
@@ -1335,6 +1454,8 @@ wss.on("connection", (ws) => {
         undoUsed: false,
         undoRequests: { black: 0, white: 0 },
         notifications: [],
+        startedAt: Date.now(),
+        resultLoggedAt: null,
       };
       broadcastState(wss);
       return;
@@ -1360,14 +1481,17 @@ wss.on("connection", (ws) => {
 
       if (action.type === "place") {
         if (current.turn !== playerColor) return;
-        next = placeStone(current, action.x, action.y);
+        const x = parseCoord(action?.x, BOARD.columns);
+        const y = parseCoord(action?.y, BOARD.rows);
+        if (!x || !y) return;
+        next = placeStone(current, x, y);
       } else if (action.type === "pass") {
         if (current.turn !== playerColor) return;
         next = passTurn(current);
-        pushNotice(room, `${userId} 패스`);
+        pushNotice(room, `${userId} passed`);
       } else if (action.type === "resign") {
         next = resign(current, playerColor);
-        pushNotice(room, `${userId} 기권`);
+        pushNotice(room, `${userId} resigned`);
       } else if (action.type === "score") {
         return;
       } else if (action.type === "undoRequest") {
@@ -1394,7 +1518,7 @@ wss.on("connection", (ws) => {
             room.game.timer.turnStartAt = Date.now();
             room.game.timer.remainingMs = room.game.timer.periodMs;
           }
-          pushNotice(room, `AI ${room.ai.name} 한수 무르기 수락`);
+          pushNotice(room, `AI ${room.ai.name} accepted undo`);
           broadcastState(wss);
           return;
         }
@@ -1403,7 +1527,7 @@ wss.on("connection", (ws) => {
           to: opponent,
           at: Date.now(),
         };
-        pushNotice(room, `${userId} 한수 무르기 요청`);
+        pushNotice(room, `${userId} requested undo`);
         broadcastState(wss);
         return;
       } else if (action.type === "scoreRequest" && room.ai?.enabled) {
@@ -1428,7 +1552,7 @@ wss.on("connection", (ws) => {
           to: opponent,
           at: Date.now(),
         };
-        pushNotice(room, `${userId} 계가 요청`);
+        pushNotice(room, `${userId} requested scoring`);
         broadcastState(wss);
         return;
       } else if (action.type === "undoAccept") {
@@ -1446,14 +1570,14 @@ wss.on("connection", (ws) => {
           room.game.timer.turnStartAt = Date.now();
           room.game.timer.remainingMs = room.game.timer.periodMs;
         }
-        pushNotice(room, `한수 무르기 수락`);
+        pushNotice(room, `Undo accepted`);
         broadcastState(wss);
         return;
       } else if (action.type === "undoReject") {
         const pending = room.game.pendingUndo;
         if (!pending || pending.to !== userId) return;
         room.game.pendingUndo = null;
-        pushNotice(room, `한수 무르기 거절`);
+        pushNotice(room, `Undo rejected`);
         broadcastState(wss);
         return;
       } else if (action.type === "scoreAccept") {
@@ -1461,12 +1585,12 @@ wss.on("connection", (ws) => {
         if (!pending || pending.to !== userId) return;
         room.game.pendingScore = null;
         next = scoreNow(current);
-        pushNotice(room, `계가 합의`);
+        pushNotice(room, `Scoring agreed`);
       } else if (action.type === "scoreReject") {
         const pending = room.game.pendingScore;
         if (!pending || pending.to !== userId) return;
         room.game.pendingScore = null;
-        pushNotice(room, `계가 거절`);
+        pushNotice(room, `Scoring rejected`);
         broadcastState(wss);
         return;
       }
@@ -1485,10 +1609,11 @@ wss.on("connection", (ws) => {
     }
 
     if (type === "chatSend") {
-      const text = normalizeUser(message?.text);
+      const text = normalizeText(message?.text, MAX_CHAT_TEXT);
       if (!text) return;
-      const scope = normalizeUser(message?.scope) || "lobby";
-      const roomId = normalizeUser(message?.roomId) || "global";
+      const rawScope = normalizeUser(message?.scope).toLowerCase();
+      const scope = rawScope === "game" ? "game" : "lobby";
+      const roomId = normalizeText(message?.roomId, 80) || "global";
       if (scope === "game") {
         const room = getRoom(roomId);
         if (!room) return;
@@ -1511,7 +1636,7 @@ wss.on("connection", (ws) => {
         ts: Date.now(),
       };
       state.chat.channels[key] = [...list, entry].slice(-200);
-      broadcastState(wss);
+      emitChatEvent(wss, clients, scope, roomId, entry);
       return;
     }
 
@@ -1524,7 +1649,7 @@ wss.on("connection", (ws) => {
   ws.on("close", () => {
     const info = clients.get(ws);
     clients.delete(ws);
-    const userId = normalizeUser(info?.userId);
+    const userId = parseUserId(info?.userId);
     if (userId) {
       console.info(`[ws] close user=${userId}`);
       removeUserEverywhere(userId, false, { preserveAiRooms: true, reason: "ws_close" });
@@ -1536,7 +1661,7 @@ wss.on("connection", (ws) => {
 console.log(`Lobby WebSocket server listening on ws://localhost:${PORT}`);
 
 setTimeout(() => {
-  warmupKataGo();
+  if (!AI_IS_INDEPENDENT) warmupKataGo();
 }, 100);
 
 setInterval(() => {
@@ -1550,6 +1675,7 @@ setInterval(() => {
     const history = room.game.history;
     const current = history[history.length - 1];
     if (current.over) {
+      maybeLogAiGameResult(room, now);
       return;
     }
     const isAiTurnNow = room.ai?.enabled && isAiTurn(room, current.turn);
@@ -1564,8 +1690,9 @@ setInterval(() => {
     }
     const elapsed = now - timer.turnStartAt;
     const remaining = Math.max(0, timer.periodMs - elapsed);
-    if (remaining !== timer.remainingMs) {
-      timer.remainingMs = remaining;
+    const remainingRounded = Math.ceil(remaining / 1000) * 1000;
+    if (remainingRounded !== timer.remainingMs) {
+      timer.remainingMs = remainingRounded;
       changed = true;
     }
 
@@ -1601,7 +1728,7 @@ setInterval(() => {
         !room.game.pendingScore &&
         !room.game.pendingUndo
       ) {
-        if (!katagoAvailable) return;
+        if (!AI_IS_INDEPENDENT && !katagoAvailable) return;
         const aiConfig = getAiConfig(room, current.turn);
         if (!aiConfig) return;
         const lastMoveAt = aiConfig.lastMoveAt || 0;
@@ -1663,7 +1790,11 @@ setInterval(() => {
         }
       }
 
-      if (KATAGO_ANALYSIS_ENABLED && !analysisInFlight.has(room.name)) {
+      if (
+        !AI_IS_INDEPENDENT &&
+        KATAGO_ANALYSIS_ENABLED &&
+        !analysisInFlight.has(room.name)
+      ) {
         const analysis = room.game.analysis;
         const lastAt = analysis?.updatedAt || 0;
         if (now - lastAt >= KATAGO_ANALYSIS_INTERVAL_MS) {
@@ -1690,4 +1821,12 @@ setInterval(() => {
     broadcastState(wss);
   }
 }, 200);
+
+
+
+
+
+
+
+
 
