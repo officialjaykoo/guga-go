@@ -65,8 +65,7 @@ const getNeighbors = (x, y, columns, rows) => {
   return out;
 };
 
-const adjacencyFeatures = (state, x, y, columns, rows, player) => {
-  const map = buildStoneMap(state?.stones || []);
+const adjacencyFeatures = (map, x, y, columns, rows, player) => {
   let ownAdj = 0;
   let oppAdj = 0;
   let greenAdj = 0;
@@ -206,17 +205,19 @@ export const pickIndependentMove = (
   const passPrior = safeNumber(model?.priors?.pass?.[turn], -4);
   const passPhasePrior = safeNumber(model?.phasePriors?.[phase]?.pass?.[turn], 0);
   const noiseScale = getDifficultyNoise(difficulty);
+  const stoneMap = buildStoneMap(state?.stones || []);
 
   let best = null;
 
   for (let y = 1; y <= rows; y += 1) {
     for (let x = 1; x <= columns; x += 1) {
+      if (stoneMap.has(`${x},${y}`)) continue;
       const next = placeStone(state, x, y);
       if (next === state) continue;
 
       const captureDelta =
         safeNumber(next?.captures?.[turn], 0) - safeNumber(state?.captures?.[turn], 0);
-      const adj = adjacencyFeatures(state, x, y, columns, rows, turn);
+      const adj = adjacencyFeatures(stoneMap, x, y, columns, rows, turn);
       const prior = safeNumber(priors?.[`${x},${y}`], 0);
       const phasePrior = safeNumber(phasePriors?.[`${x},${y}`], 0);
       const center = centerBias(x, y, columns, rows);

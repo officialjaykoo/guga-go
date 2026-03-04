@@ -133,6 +133,14 @@ const buildLabeledRows = ({ gameRows, moveRows, maxWinrateDrop, allowPass, minMo
       dropped.invalidPolicy += 1;
       continue;
     }
+    if (!isPass) {
+      const px = Number(selectedMove?.x);
+      const py = Number(selectedMove?.y);
+      if (!Number.isInteger(px) || !Number.isInteger(py)) {
+        dropped.invalidPolicy += 1;
+        continue;
+      }
+    }
 
     const winner = g?.outcome?.winnerColor;
     if (winner !== "black" && winner !== "white") {
@@ -153,7 +161,9 @@ const buildLabeledRows = ({ gameRows, moveRows, maxWinrateDrop, allowPass, minMo
     }
 
     const valueTarget = winner === turn ? 1 : 0;
-    const policyTarget = isPass ? { pass: true } : selectedMove;
+    const policyTarget = isPass
+      ? { pass: true }
+      : { x: Number(selectedMove.x), y: Number(selectedMove.y) };
 
     labeled.push({
       schemaVersion: "guga-train-v1",
@@ -207,7 +217,7 @@ const run = () => {
     ? Number(args.maxWinrateDrop)
     : 0.08;
   const allowPass = toBool(args.allowPass, true);
-  const minMoves = Number(args.minMoves) || 40;
+  const minMoves = Number(args.minMoves) || 60;
   const maxMoves = Number(args.maxMoves) || 350;
   const trainRatio = Number.isFinite(Number(args.trainRatio)) ? Number(args.trainRatio) : 0.9;
   const valRatio = Number.isFinite(Number(args.valRatio)) ? Number(args.valRatio) : 0.08;

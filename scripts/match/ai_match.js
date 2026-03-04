@@ -402,7 +402,6 @@ const run = async () => {
     ? Number(args.komi)
     : 0;
   const komiInternal = getInternalKomi(komi);
-  const writeJson = args.json === undefined ? false : args.json !== "0";
   const datasetEnabled = args.dataset === undefined ? true : args.dataset !== "0";
   const writeSgf = args.writeSgf === undefined ? false : args.writeSgf !== "0";
 
@@ -657,29 +656,11 @@ const run = async () => {
     })
     .sort((a, b) => b.scoreRate - a.scoreRate);
 
-  const csvLines = ["game,black,white,black_key,white_key,result,moves,duration,sgf"];
-  results.forEach((row) => {
-    csvLines.push(
-      `${row.game},${row.black},${row.white},${row.blackKey},${row.whiteKey},${row.result},${row.moves},${row.duration},${row.sgf}`
-    );
-  });
   const playedEndIndex = startIndex + Math.max(0, results.length - 1);
   const rangeName = `game${padNumber(startIndex, idWidth)}-game${padNumber(
     playedEndIndex,
     idWidth
   )}`;
-  fs.writeFileSync(
-    path.join(outDir, `results_${rangeName}.csv`),
-    csvLines.join("\n"),
-    "utf8"
-  );
-  if (writeJson) {
-    fs.writeFileSync(
-      path.join(outDir, `results_${rangeName}.json`),
-      JSON.stringify(results, null, 2),
-      "utf8"
-    );
-  }
   if (datasetEnabled && datasetRows.length) {
     const datasetPath = path.join(outDir, `dataset_${rangeName}.jsonl`);
     const jsonl = datasetRows.map((entry) => JSON.stringify(entry)).join("\n");

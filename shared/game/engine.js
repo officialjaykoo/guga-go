@@ -17,7 +17,11 @@ export function createInitialState(ruleset = "korean", komi = DEFAULT_KOMI) {
   };
 }
 
-export function isOccupied(stones, x, y) {
+export function isOccupied(stones, x, y, board = null) {
+  const key = `${x},${y}`;
+  if (board instanceof Map) {
+    return board.has(key);
+  }
   return stones.some((stone) => stone.x === x && stone.y === y);
 }
 
@@ -420,12 +424,13 @@ export function suggestDeadStones(stones) {
 export function placeStone(state, x, y) {
   const ix = Number(x);
   const iy = Number(y);
+  const currentBoard = buildBoard(state.stones);
   if (
     state.over ||
     !Number.isInteger(ix) ||
     !Number.isInteger(iy) ||
     !inBounds(ix, iy) ||
-    isOccupied(state.stones, ix, iy)
+    isOccupied(state.stones, ix, iy, currentBoard)
   ) {
     return state;
   }
@@ -463,7 +468,7 @@ export function placeStone(state, x, y) {
       score: null,
       moveCount: moveCount + 1,
       lastMove: { type: "stone", player, x: ix, y: iy },
-      boardHashes: [...state.boardHashes, newHash],
+      boardHashes: [...state.boardHashes.slice(-1), newHash],
     };
   }
 
@@ -518,7 +523,7 @@ export function placeStone(state, x, y) {
     score: null,
     moveCount: moveCount + 1,
     lastMove: { type: "stone", player, x: ix, y: iy },
-    boardHashes: [...state.boardHashes, newHash],
+    boardHashes: [...state.boardHashes.slice(-1), newHash],
   };
 }
 

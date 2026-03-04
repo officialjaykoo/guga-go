@@ -460,9 +460,17 @@ export const setupKatagoPosition = async (
 
   const moves = buildMoveListFromHistory(history, greenAs);
   const rulesValue = getKataGoRuleset(ruleset);
+  const sameKomi = (a, b) => {
+    const na = Number(a);
+    const nb = Number(b);
+    if (Number.isFinite(na) && Number.isFinite(nb)) {
+      return Math.abs(na - nb) < 1e-6;
+    }
+    return a === b;
+  };
   const needsReset =
     client.lastSetupRuleset !== rulesValue ||
-    client.lastSetupKomi !== komi ||
+    !sameKomi(client.lastSetupKomi, komi) ||
     !Array.isArray(client.positionMoves);
 
   const isSameMove = (a, b) => {
