@@ -17,6 +17,34 @@ const logWarn = (...args) => {
   }
 };
 
+const formatKatagoExit = (code, signal) => {
+  const parts = [];
+  if (code !== null && code !== undefined) parts.push(`code=${code}`);
+  if (signal !== null && signal !== undefined) parts.push(`signal=${signal}`);
+  if (!parts.length) return "";
+  return ` (${parts.join(", ")})`;
+};
+
+const getKatagoExitHint = (code) => {
+  const numeric = Number(code);
+  if (numeric === 3221225781 || numeric === -1073741515) {
+    return "KataGo failed to load a required DLL (Windows STATUS_DLL_NOT_FOUND, 0xC0000135). For CUDA builds, check CUDA/cuDNN DLL compatibility and PATH.";
+  }
+  if (numeric === 3221225501 || numeric === -1073741795) {
+    return "KataGo hit an illegal instruction (0xC000001D). This can happen with unsupported CPU instructions or mismatched binary builds.";
+  }
+  return "";
+};
+
+const buildKatagoUnavailableError = (name, lastExit) => {
+  const detail = lastExit
+    ? formatKatagoExit(lastExit.code, lastExit.signal)
+    : "";
+  const hint = lastExit ? getKatagoExitHint(lastExit.code) : "";
+  const message = `${name} process not started.${detail}`;
+  return new Error(hint ? `${message} ${hint}` : message);
+};
+
 export class GtpClient {
   constructor({
     command,
@@ -41,6 +69,8 @@ export class GtpClient {
     this.onUnknownCommand = onUnknownCommand;
     this.deferStderr = deferStderr;
     this.stderrBuffer = [];
+    this.lastExit = null;
+    this.stopPermanent = true;
     this.proc = null;
     this.queue = [];
     this.current = null;
@@ -58,14 +88,17 @@ export class GtpClient {
 
   start() {
     if (this.proc || this.closed) return;
-    this.proc = spawn(this.command, this.args, {
+    const proc = spawn(this.command, this.args, {
       cwd: this.cwd,
       stdio: ["pipe", "pipe", "pipe"],
     });
+    this.proc = proc;
+    this.closed = false;
+    this.stopPermanent = true;
     this.readyAt = Date.now() + this.startupDelayMs;
-    const rl = createInterface({ input: this.proc.stdout });
+    const rl = createInterface({ input: proc.stdout });
     rl.on("line", (line) => this._onLine(line));
-    this.proc.stderr.on("data", (chunk) => {
+    proc.stderr.on("data", (chunk) => {
       const text = String(chunk).trim();
       if (!text) return;
       if (this.deferStderr) {
@@ -74,29 +107,39 @@ export class GtpClient {
       }
       logWarn(`[${this.name}]`, text);
     });
-    this.proc.on("exit", (code, signal) => {
+    proc.on("exit", (code, signal) => {
+      if (this.proc !== proc) return;
       logWarn(`[${this.name}] exited`, { code, signal });
+      this.lastExit = { code, signal, at: Date.now() };
+      const hint = getKatagoExitHint(code);
+      if (hint) {
+        logWarn(`[${this.name}]`, hint);
+      }
       this.proc = null;
-      this.closed = true;
+      this.closed = this.stopPermanent;
+      this.stopPermanent = true;
       if (typeof this.onExit === "function") {
         this.onExit({ code, signal });
       }
       if (this.current) {
-        this.current.reject(new Error(`${this.name} exited before response.`));
+        const detail = formatKatagoExit(code, signal);
+        const message = `${this.name} exited before response.${detail}`;
+        this.current.reject(new Error(hint ? `${message} ${hint}` : message));
         this.current = null;
       }
       this.queue.splice(0).forEach((item) => {
-        item.reject(new Error(`${this.name} not available.`));
+        item.reject(buildKatagoUnavailableError(this.name, this.lastExit));
       });
     });
   }
 
-  stop() {
+  stop({ permanent = true } = {}) {
+    this.stopPermanent = permanent;
     if (this.proc) {
       this.proc.kill();
       this.proc = null;
     }
-    this.closed = true;
+    this.closed = permanent;
     this.boardSizeValue = null;
     this.positionMoves = null;
     this.lastSetupRuleset = null;
@@ -122,7 +165,9 @@ export class GtpClient {
       this.start();
     }
     if (!this.proc) {
-      return Promise.reject(new Error(`${this.name} process not started.`));
+      return Promise.reject(
+        buildKatagoUnavailableError(this.name, this.lastExit)
+      );
     }
     return new Promise((resolve, reject) => {
       const item = {
@@ -137,7 +182,7 @@ export class GtpClient {
       if (delay > 0) {
         setTimeout(() => {
           if (this.closed) {
-            item.reject(new Error(`${this.name} not available.`));
+            item.reject(buildKatagoUnavailableError(this.name, this.lastExit));
             return;
           }
           this.queue.push(item);
@@ -171,7 +216,12 @@ export class GtpClient {
           }
           this.stop();
         }
-        this.current.reject(new Error(`${this.name} timeout on command.`));
+        const command = String(this.current.command || "").trim();
+        this.current.reject(
+          new Error(
+            `${this.name} timeout on command: ${command || "<empty>"}`
+          )
+        );
         this.current = null;
         this._flush();
       }, this.current.timeoutMs);
@@ -235,7 +285,7 @@ export const sendWithRetry = async (client, command, timeoutMs, retryTimeoutMult
     return await client.send(command, timeoutMs);
   } catch (err) {
     if (!isTimeoutError(err)) throw err;
-    client.stop();
+    client.stop({ permanent: false });
     client.start();
     const retryMs = Math.max(timeoutMs * retryTimeoutMult, timeoutMs);
     return await client.send(command, retryMs);

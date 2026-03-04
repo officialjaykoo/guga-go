@@ -112,7 +112,7 @@ const KATAGO_MAX_TIMEOUTS = Number(process.env.KATAGO_MAX_TIMEOUTS) || 10;
 const KATAGO_RETRY_TIMEOUT_MULT =
   Number(process.env.KATAGO_RETRY_TIMEOUT_MULT) || 2;
 const KATAGO_SETUP_TIMEOUT_MS =
-  Number(process.env.KATAGO_SETUP_TIMEOUT_MS) || 1200;
+  Number(process.env.KATAGO_SETUP_TIMEOUT_MS) || 5000;
 const KATAGO_CANDIDATE_COUNT =
   Number(process.env.KATAGO_CANDIDATE_COUNT) || 10;
 const AI_GREEN_CANDIDATE_RADIUS =
@@ -1692,8 +1692,14 @@ const run = async () => {
   client.start();
   try {
     await client.send("list_commands", 800);
-  } catch {
-    // ignore warmup failures
+  } catch (err) {
+    client.enableStderr();
+    const reason = String(err?.message || err).replace(/\s+$/, "");
+    const reasonLine = /[.!?]$/.test(reason) ? reason : `${reason}.`;
+    throw new Error(
+      `KataGo startup check failed: ${reasonLine} ` +
+        "Verify KATAGO_PATH/KATAGO_CONFIG/KATAGO_MODEL and required runtime DLLs."
+    );
   }
   client.enableStderr();
 

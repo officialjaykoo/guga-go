@@ -1,11 +1,45 @@
+import fs from "node:fs";
+import path from "node:path";
+
 const toNumber = (value) => {
   const parsed = Number(value);
   return Number.isFinite(parsed) ? parsed : undefined;
 };
 
+const readKatagoBaseFromConfig = () => {
+  const configPath = process.env.KATAGO_CONFIG;
+  if (!configPath) return {};
+  try {
+    const resolved = path.isAbsolute(configPath)
+      ? configPath
+      : path.resolve(process.cwd(), configPath);
+    const text = fs.readFileSync(resolved, "utf8");
+    const base = {};
+    for (const line of text.split(/\r?\n/)) {
+      const trimmed = line.trim();
+      if (!trimmed || trimmed.startsWith("#")) continue;
+      const eq = trimmed.indexOf("=");
+      if (eq <= 0) continue;
+      const key = trimmed.slice(0, eq).trim();
+      const value = trimmed.slice(eq + 1).trim();
+      if (key === "maxVisits") {
+        base.maxVisits = toNumber(value);
+      } else if (key === "maxTime") {
+        base.maxTime = toNumber(value);
+      }
+    }
+    return base;
+  } catch {
+    return {};
+  }
+};
+
+const cfgBase = readKatagoBaseFromConfig();
+
 export const AI_DIFFICULTY_BASE = {
-  maxVisits: toNumber(process.env.KATAGO_BASE_MAX_VISITS) ?? 400,
-  maxTime: toNumber(process.env.KATAGO_BASE_MAX_TIME) ?? 4.0,
+  maxVisits:
+    toNumber(process.env.KATAGO_BASE_MAX_VISITS) ?? cfgBase.maxVisits ?? 400,
+  maxTime: toNumber(process.env.KATAGO_BASE_MAX_TIME) ?? cfgBase.maxTime ?? 4.0,
 };
 
 const DIFFICULTY_RATIOS = {
